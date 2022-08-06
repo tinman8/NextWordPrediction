@@ -12,6 +12,10 @@ The live app can be found:
 
 Contains the code for building the model and an explanation on how the model is built.
 
+[https://tinman8.github.io/NextWordPrediction/model/](https://tinman8.github.io/NextWordPrediction/presentation/)
+
 #### Presentation
 
 Contains the code for the presentation portion of the Capstone project.
+
+<https://tinman8.github.io/NextWordPrediction/presentation/>
