@@ -1,0 +1,759 @@
+---
+title: "N-Gram Model for Next Word Predicition"
+author: "TI"
+date: "`r Sys.Date()`"
+output: html_document
+editor_options: 
+  markdown: 
+    wrap: 72
+---
+
+# Executive Summary
+
+This document outlines creating, using, and testing and N-Gram model for
+use to make next word predictions. The model uses one to four gram
+models interpolated together to calculate a probability. The probability
+were smoothed using the Good-Turing method, and the next word is
+selected using the Stupid Backoff method.
+
+The model achieves moderately good performance in next word in
+prediction at 15% accurate, and has the correct in the top-3 at 20%. The
+model makes predictions quickly, returning a result in less then 0.05
+seconds (this will be hardware dependent). At 101mb the model can be
+used on all modern devices.
+
+This model is a starting point for more advanced and accurate models.
+There are numerous improvements that could be made and more
+experimenting remaining to achieve higher accuracy results. According to
+SwiftKey's support page, they have achieved an accuracy of 33%. This may
+be the upper limit of what is possible with next word prediction, in the
+English language, due to the very complex nature of the language.
+
+If this report is being reproduced, consideration should be taken for
+the amount of memory required to calculate higher order N-Grams. As
+well, some calculations are quite intensive and can take a considerable
+amount of time. The report was created on a machine with 16gb of RAM,
+16gb of swap space, a 6 core/12 thread/3.6ghz CPU. With this machine,
+the 4-gram model took a considerable amount of space and time to create.
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# The Data
+
+The initial data set is provided by SwiftKey, and the raw data can be
+downloaded along side this report in GitHub.
+
+The data was previously cleaned and sampled, and the process can also be
+found along this document in the `cleanData.R` file. A sampled of
+1,000,000 sentences was used. This is aproximately 1/3 of the clean
+data. A testing set was also created. Based on previous investigation,
+the full corpus is not required due to numerous repeat words and
+decreasing novel words, see:
+<https://en.wikipedia.org/wiki/Zipf%27s_law>.
+
+## Functions
+
+The following functions will are utility functions to create N-Grams
+from the sampled tokens, generate a frequency table from the n-grams,
+and a function to calculate Good-Turing.
+
+The tokens are read from the `training_tokens.RDS` file created in the
+`cleanData.R` script.
+
+```{r}
+library(quanteda, quietly = FALSE)
+
+toks <- readRDS("training_tokens.RDS")
+
+get_ngramtoks <- function(n) {
+    tokens_ngrams(toks, n = n, concatenator = " ")
+}
+
+get_freqs <- function(ngram_toks, min_term_freq = 2) {
+    freqs <- featfreq(dfm(ngram_toks))
+    data.table(
+        x = names(freqs),
+        freq = freqs
+    )
+}
+
+good_turing <- function(count, lookups) {
+    next_count <- count + 1
+    oldfreq <- lookups[lookups$x == count,]$freq
+    oldfreq_next <- lookups[lookups$x == next_count,]$freq
+    
+    revised_count <- (count + 1) * (oldfreq_next / oldfreq)
+    as.numeric(revised_count)
+}
+```
+
+# N-Gram Models
+
+## Unigram
+
+The following section will generate the 1-gram or unigram model. A
+unigram is a single word, and the probability calculated is how often
+the word appears in the data set.
+
+### Get Unigram Dataset 
+
+Using the utility functions, the 1-grams are generated and the
+frequencies calculated. For the Good-Turing calculation, a frequency of
+frequencies table is created. This is also used to select a K value. The
+K value used will be the value where the frequency of a unigram, called
+X, is no longer higher then the next frequency. For this data set, and
+the K value is 22. See below table for further explanation.
+
+```{r, eval = FALSE}
+library(dplyr, quietly = TRUE)
+library(tidyr)
+library(tibble)
+library(data.table, quietly = TRUE)
+
+unigram <- get_ngramtoks(1)
+unigram_freq <- get_freqs(unigram)
+
+vocab <- unigram_freq$x
+V <- length(vocab)
+
+unigram_freq$freq_factor <- factor(x = unigram_freq$freq)
+unifreq_lookups <- plyr::count(unigram_freq$freq_factor)
+print(unifreq_lookups[15:25])
+```
+
+### Generate Unigram Model
+
+The unigram model is created by first inputting the frequency
+information into a `data.table` for memory efficiency. The `y` value is
+the prediction and the `unigram` value would be the output. A row is
+added to the unigram model for an unknown value, it has a frequency
+of 1. This will be to account for any words that are not known to the
+model. Finally the probability is calculated. The column is labeled as
+`GT` to difference it from the other methods used, these methods are
+commented out. The log of the probability is taken to normalize the
+values. Due to the large number of data points, some probabilities will
+be very small in non-log scale.
+
+```{r, eval=FALSE}
+K <- 22
+N <- sum(ntoken(toks))
+unigrams <- data.table(
+        unigram = unigram_freq$x, 
+        freq = unigram_freq$freq,
+        y = unigram_freq$x
+    ) %>% 
+    add_row(
+        unigram = "<UNK>", 
+        freq = 1, 
+        y = "<UNK>"
+    ) %>% 
+    mutate(
+        # MLE = log((freq) / (N)),
+        # MLE.ONE = log((freq + 1) / (N + V)),
+        GT = sapply(
+            freq, function(x) {
+                # x = frequency
+                if (x < K) {
+                    log(good_turing(x, unifreq_lookups) / N)
+                } else {
+                    log(x / N)
+                }
+            }
+        )
+    ) 
+
+saveRDS(unigrams, file = "unigrams.RDS")
+rm(unigram, unigram_freq, unifreq_lookups); invisible(gc());
+```
+
+## Bigram
+
+The following section will create the 2-gram or bigram model. The same
+process as the unigram will be taken. \### Get Bigram Dataset
+
+```{r}
+library(multidplyr)
+library(dplyr, warn.conflicts = FALSE)
+library(tidyr)
+library(data.table)
+
+bigram <- get_ngramtoks(2)
+bigram_freq <- get_freqs(bigram)
+
+bigram_freq$freq_factor <- factor(x = bigram_freq$freq)
+bifreq_lookups <- plyr::count(bigram_freq$freq_factor)
+print(bifreq_lookups[35:45,])
+
+saveRDS(bifreq_lookups, "bifreq_lookups.RDS")
+```
+
+### Generate Bigram Model
+
+The same general process to create the unigram model is used here. With
+the bigram model, the unigram model is merged with the bigram
+frequencies to efficiently calculated the probabilities. As well further
+manipulation of the data is done to make the output more readable, such
+as renaming columns, and creating a `y` value. During some model
+generations, there are probabilities that are created with a value
+greater then 0, which is not possible. It appeared to be a bug in the
+code, and a line was added to turn GT values greater then 0, to 0.
+
+Multi-threading is also used to calculate the probabilities in a
+reasonable amount of time. If this report is being reproduced is
+recommended to use a cluster value that is CPU threads minus 1 or 2
+threads. R objects are saved to file as checkpoints in the model
+creation.
+
+```{r, eval = FALSE}
+K = 39
+# Bigram MLE lookup table
+cluster <- new_cluster(10)
+unigrams <- readRDS("unigrams.RDS")
+
+bigrams <- data.table(
+        bigram = bigram_freq$x, 
+        freq = bigram_freq$freq
+    ) %>%
+    mutate(unigram = sapply(strsplit(.$bigram, " "), function(x) x[1])) %>%
+    left_join(., unigrams, by = "unigram") %>%
+    rename(bigram.freq = freq.x, unigram.freq = freq.y, x1 = unigram) %>%
+    partition(cluster) %>%
+    mutate(
+        # MLE = log(bigram.freq / unigram.freq), 
+        # MLE.ONE = log((bigram.freq + 1) / (unigram.freq + V)),
+        GT = mapply(
+            function(bi, uni) {
+                if (bi < 39) {  ## ALWAYS UPDATE **K**
+                    count <- bi
+                    lookups <- readRDS("bifreq_lookups.RDS")
+                    
+                    next_count <- count + 1
+                    oldfreq <- lookups[lookups$x == count,]$freq
+                    oldfreq_next <- lookups[lookups$x == next_count,]$freq
+                    
+                    revised_count <- (count + 1) * (oldfreq_next / oldfreq)
+                    log(as.numeric(revised_count) / uni)
+                    
+                    # log(good_turing(bi, bifreq_lookups) / uni)
+                } else {
+                    log(bi / uni)
+                }
+            }, 
+            bigram.freq, 
+            unigram.freq
+        ),
+        GT = replace(GT, GT > 0, 0),
+        y = sapply(bigram, function(x) strsplit(x, " ")[[1]][2]),
+    ) %>%
+    collect() %>%
+    drop_na()
+
+saveRDS(bigrams, file = "bigrams.RDS")
+rm(bigram, bigram_freq, bifreq_lookups); invisible(gc())
+```
+
+## Trigram
+
+The following section will create the trigram model, the same process as
+the bigram is used.
+
+### Get Trigram Dataset
+
+```{r}
+library(multidplyr)
+library(dplyr, warn.conflicts = FALSE)
+library(tidyr)
+library(data.table)
+
+trigram <- get_ngramtoks(3)
+trigram_freq <- get_freqs(trigram)
+
+trigram_freq$freq_factor <- factor(x = trigram_freq$freq)
+trifreq_lookups <- plyr::count(trigram_freq$freq_factor)
+print(trifreq_lookups[37:47,])
+
+rm(trigram, toks, get_ngramtoks, get_freqs); gc(verbose = FALSE);
+saveRDS(trifreq_lookups, "trifreq_lookups.RDS")
+```
+
+### Generate the Trigram model
+
+```{r, eval=FALSE}
+K = 43
+
+bigrams <- readRDS("bigrams.RDS")
+cluster <- new_cluster(10)
+
+# Trigram MLE lookup table
+trigrams <- data.table(
+    trigram = trigram_freq$x, 
+    freq = trigram_freq$freq
+    ) %>% 
+    mutate(
+        bigram = sapply(
+            strsplit(.$trigram, " "), function(x) paste(x[1:2], collapse = " ")
+        )
+    ) %>%
+    left_join(., bigrams, by = "bigram") %>% # keep all rows in trigrams
+    select(bigram, trigram, bigram.freq, freq) %>%
+    rename(trigram.freq = freq, x2 = bigram) %>%
+    partition(cluster) %>%
+    mutate(
+        # MLE = log(trigram.freq / bigram.freq),
+        # MLE.ONE = log((trigram.freq + 1) / (bigram.freq + V)),
+        GT = mapply(
+            function(tri, bi) {
+                if (tri < 43) {  ## ALWAYS UPDATE **K**
+                    count <- tri
+                    lookups <- readRDS("trifreq_lookups.RDS")
+                    
+                    next_count <- count + 1
+                    oldfreq <- lookups[lookups$x == count,]$freq
+                    oldfreq_next <- lookups[lookups$x == next_count,]$freq
+                    
+                    revised_count <- (count + 1) * (oldfreq_next / oldfreq)
+                    log(as.numeric(revised_count) / bi)
+                    
+                    # log(good_turing(tri, trifreq_lookups) / bi)
+                } else {
+                    log(tri / bi)
+                }
+            }, 
+            trigram.freq, 
+            bigram.freq
+        ),
+        GT = replace(GT, GT > 0, 0),
+        y = sapply(trigram, function(x) strsplit(x, " ")[[1]][3])
+    ) %>%
+    collect() %>%
+    drop_na()
+
+saveRDS(trigrams, file = "trigrams.RDS")
+rm(trigram_freq); invisible(gc());
+```
+
+## Quad-Gram
+
+The following section will create the 4-gram model or quad-gram or
+fourgram. The same process as the trigram/bigram is used. However, to do
+the size of the fourgram model in memory, additional checkpoints are
+saved to allow for the memory to be fully cleared and restarted between
+steps. \### Get Quad Grams
+
+```{r}
+library(dplyr)
+library(tidyr)
+library(data.table)
+
+fourgram <- get_ngramtoks(4)
+fourgram_freq <- get_freqs(fourgram)
+
+fourgram_freq$freq_factor <- factor(x = fourgram_freq$freq)
+fourfreq_lookups <- plyr::count(fourgram_freq$freq_factor) %>% setDT(.)
+print(fourfreq_lookups[25:35,])
+
+saveRDS(fourgram, "fourgram_toks.RDS")
+saveRDS(fourgram_freq, "fourgram_freq.RDS")
+saveRDS(fourfreq_lookups, "fourgram_looksups.RDS")
+```
+
+```{r, eval=FALSE}
+library(multidplyr)
+library(dplyr, warn.conflicts = FALSE)
+library(tidyr)
+library(data.table)
+
+K <- 29
+
+fourgram <- readRDS("fourgram_toks.RDS")
+fourgram_freq <- readRDS("fourgram_freq.RDS")
+trigrams <- readRDS("trigrams.RDS")
+
+cluster <- new_cluster(10)
+
+fourgrams <- data.table(
+    fourgram = fourgram_freq$x, 
+    freq = fourgram_freq$freq
+    ) %>% 
+    mutate(
+        trigram = sapply(
+            strsplit(.$fourgram, " "), function(x) paste(x[1:3], collapse = " ")
+        )
+    ) %>%
+    left_join(., trigrams, by = "trigram") %>% # keep all rows in trigrams
+    select(trigram, fourgram, trigram.freq, freq) %>%
+    rename(fourgram.freq = freq, x3 = trigram) %>%
+    partition(cluster)%>%
+    mutate(
+        # MLE = log(fourgram.freq / trigram.freq),
+        # MLE.ONE = log((fourgram.freq + 1) / (trigram.freq + 244655)),
+        GT = mapply(
+            function(four, tri) {
+                lookups <- readRDS("fourgram_looksups.RDS")
+                if (four < 29) {  ## UPDATE **K** VALUE
+                    count <- four
+                    next_count <- count + 1
+                    oldfreq <- lookups[lookups$x == count,]$freq
+                    oldfreq_next <- lookups[lookups$x == next_count,]$freq
+                    
+                    revised_count <- (count + 1) * (oldfreq_next / oldfreq)
+                    log(as.numeric(revised_count) / tri)
+                    
+                    # log(good_turing(four, freq_lookups) / tri)
+                } else {
+                    log(four / tri)
+                }
+            }, 
+            fourgram.freq, 
+            trigram.freq
+        ),
+        GT = replace(GT, GT > 0, 0),
+        y = sapply(fourgram, function(x) strsplit(x, " ")[[1]][4])
+    ) %>%
+    collect() %>%
+    arrange(fourgram, desc(GT)) %>%
+    drop_na()
+
+saveRDS(fourgrams, file = "fourgrams.RDS")
+rm(fourgram, fourgram_freq); invisible(gc());
+```
+
+## Slice The Data
+
+To keep the models as small as possible prior to the next steps, any
+n-grams that have a frequency of 1 are removed. Typically, one frequency
+grams are frequent and do not play a significant role in the accuracy of
+the model. The lower frequency n-grams are further tweaked in the
+following steps. In this step the models are reduced by half or greater.
+For example, the fougram model is reduced from 15 million grams to
+900,000.
+
+```{r}
+library(dplyr, quietly = TRUE)
+bigrams <- readRDS("bigrams.RDS")
+trigrams <- readRDS("trigrams.RDS")
+fourgrams <- readRDS("fourgrams.RDS")
+
+bigrams <- bigrams %>% filter(bigram.freq > 1)
+trigrams <- trigrams %>% filter(trigram.freq > 1)
+fourgrams <- fourgrams %>% filter(fourgram.freq > 1)
+
+saveRDS(bigrams, file = "bigrams_sliced.RDS")
+saveRDS(trigrams, file = "trigrams_sliced.RDS")
+saveRDS(fourgrams, file = "fourgrams_sliced.RDS")
+rm(bigrams, trigrams, fourgrams); invisible(gc());
+```
+
+## Final Model
+
+A final model is created by combining all the models previously created.
+This is done by joining the previous model with the next model in the
+n-gram sequence. The probability of each n-gram is preserved in it's own
+column. In the final join, `X` columns are created for each input value
+for 1-4 gram and a single output `y` column is created. The
+probabilities for each `X` are store in there corresponding `GT` column.
+
+```{r, eval = FALSE}
+library(multidplyr)
+library(dplyr, warn.conflicts = FALSE)
+
+cluster <- new_cluster(10)
+
+unigrams <- readRDS("unigrams.RDS")
+bigrams <- readRDS("bigrams_sliced.RDS")
+trigrams <- readRDS("trigrams_sliced.RDS")
+fourgrams <- readRDS("fourgrams_sliced.RDS")
+
+bigrams <- bigrams %>% 
+    rename(x2 = bigram, GT2 = GT, y.2 = y) %>% 
+    select(x2, y.2, bigram.freq, unigram.freq, GT2)
+
+trigrams <- trigrams %>% 
+    rename(GT3 = GT, y.3 = y) %>%
+    select(trigram, y.3, trigram.freq, GT3) %>%
+    mutate(x2 = sapply(trigram, function(x) {
+        paste(strsplit(x, " ")[[1]][2:3], collapse = " ")
+    })) %>%
+    right_join(bigrams, by = "x2") %>%
+    relocate(y.2, .before = "y.3") %>%
+    relocate(x2) %>%
+    relocate(GT2, .before = "GT3") %>%
+    rename(x3 = trigram)
+
+mdl <- fourgrams %>% 
+    rename(GT4 = GT, y.4 = y) %>%
+    select(fourgram, y.4, fourgram.freq, GT4) %>%
+    mutate(x3 = sapply(fourgram, function(x) {
+        paste(strsplit(x, " ")[[1]][2:4], collapse = " ")
+    })) %>%
+    right_join(trigrams, by = "x3") %>%
+    relocate(GT4, .after = "GT3") %>%
+    relocate(y.4, .after = "y.3") %>%
+    relocate(fourgram.freq, .before = "bigram.freq") %>%
+    relocate(trigram.freq, .before = "bigram.freq") %>%
+    rename(x4 = fourgram) %>%
+    select(-c(y.3, y.4)) %>%
+    partition(cluster) %>%
+    mutate(
+        x2 = sapply(x2, function(x){
+            if (is.na(x)) {
+                x
+            } else {
+                paste(strsplit(x, " ")[[1]][1], collapse = "")
+            }
+        }),
+        x3 = sapply(x3, function(x){
+            if (is.na(x)) {
+                x
+            } else {
+                paste(strsplit(x, " ")[[1]][1:2], collapse = " ")
+            }
+        }), 
+        x4 = sapply(x4, function(x){
+            if (is.na(x)) {
+                x
+            } else {
+                paste(strsplit(x, " ")[[1]][1:3], collapse = " ")
+            }
+        })
+    ) %>%
+    collect() %>%
+    rename(y = y.2) %>%
+    right_join(unigrams, by = "y") %>%
+    filter(GT2 > -9, GT3 > -9, GT4 > -9) %>%
+    select(-c(
+         freq, fourgram.freq, trigram.freq, bigram.freq, unigram.freq, unigram
+    )) %>%
+    rename(GTy = GT) 
+
+saveRDS(mdl, "mdl.RDS")
+rm(unigrams, bigrams, trigrams, fourgrams); invisible(gc())
+```
+
+# Prediction
+
+The prediction function is implemented in the following code. It
+utilizes the Stupid Backoff method for selection. The outputs are
+selected by the most likely next words from the input phrase. The
+probabilities are interpolated with heavier weighting to higher order
+n-grams. The final values for the interpolation were based on trial and
+error to find the interpolation that produced the most accurate model.
+
+The prediction function will output a random word based on the 10 most
+likely words if a prediction cannot be made on the output.
+
+```{r}
+library(quanteda)
+library(data.table)
+library(dplyr, warn.conflicts = FALSE)
+
+mdl <- readRDS("mdl.RDS")
+mdl <- setDT(mdl)
+
+top_10_mdl <- mdl[1:10]
+top_10_mdl <- unique(top_10_mdl, by = "y")
+top_10_mdl <- setorder(top_10_mdl, -GTy)
+
+tokenize_phrase <- function(phrase) {
+    toks <- tokens(
+        phrase, 
+        remove_punct = T,
+        remove_symbols = T,
+        remove_numbers = T,
+        remove_url = T,
+        remove_separators = T,
+    )
+    toks <- tokens_tolower(toks)
+    toks <- as.list(toks)
+    toks <- toks[[1]]
+
+    
+    for (tok in toks) {
+        toks[toks == tok] <- ifelse(
+            tok %in% mdl$y, tok, "<UNK>"
+        )
+    }
+    
+    toks
+}
+
+nextWord <- function(phrase, n = 1) {
+    
+    toks <- tokenize_phrase(phrase)
+    n_toks <- length(toks)
+
+    x4_start = n_toks - 2
+    x3_start = n_toks - 1
+    
+    x4_phrase <- ifelse(
+        x4_start > 0, 
+        paste(toks[x4_start:n_toks], collapse = " "),
+        ""
+    )
+    
+    x3_phrase <- ifelse(
+        x3_start > 0,
+        paste(toks[x3_start:n_toks], collapse = " "),
+        ""
+    )
+    
+    x2_phrase <- toks[n_toks]
+    
+    mdl <- mdl[x2 == x2_phrase]
+    
+    candidates.4 <- mdl[x4 == x4_phrase]
+    
+    if (nrow(candidates.4) > 0) {
+        candidates.4 <- candidates.4[GT4 == max(GT4)]
+    }
+    candidates.3 <- mdl[x3 == x3_phrase & !y %in% candidates.4$y]
+    
+    if (nrow(candidates.3) > 0) {
+        candidates.3 <- candidates.3[GT3 == max(GT3)]
+        candidates.3 <- unique(candidates.3, by = "y")
+        candidates.3$GT4 <- NA
+        candidates.3$x4 <- NA
+    }
+    
+    candidates.2 <- mdl[
+            x2 == x2_phrase & !y %in% candidates.3$y & !y %in% candidates.4$y
+    ]
+    
+    if(nrow(candidates.2) > 0) {
+        candidates.2 <- candidates.2[GT2 == max(GT2)]
+        candidates.2 <- unique(candidates.2, by = "y")
+        candidates.2$GT3 <- NA
+        candidates.2$GT4 <- NA
+        candidates.2$x4 <- NA
+        candidates.2$x3 <- NA
+    }
+    
+    all_candidates <- rbind(candidates.4, candidates.3, candidates.2)
+
+    if (nrow(all_candidates) > 0) {
+        all_candidates$GT <- mapply(
+            function(GTy, GT2, GT3, GT4){
+                unigram_gt2 <- (GTy * 0.20) + (GT2 * 0.80)
+                unigram_gt2_gt3 <- unigram_gt2 * 0.25
+                
+                if (is.na(GT4) & is.na(GT3)) {
+                    unigram_gt2
+                } else if (is.na(GT4)) {
+                    unigram_gt2_gt3 + (GT3 * 0.75)
+                } else {
+                    ((unigram_gt2_gt3 + (GT3 * 0.75)) * 0.25) + (GT4 * 0.75)
+                }
+            }, 
+            all_candidates$GTy, 
+            all_candidates$GT2, 
+            all_candidates$GT3, 
+            all_candidates$GT4
+        )
+        all_candidates <- setorder(all_candidates, -GT)
+        all_candidates[1:n]
+    } else {
+        ## If the model can not find a prediction, output a random guess from
+        ## the most popular words
+        rand_idx <- sample(1:10, 1)
+        top_10_mdl[rand_idx]$GT2 <- NA
+        top_10_mdl[rand_idx]$GT3 <- NA
+        top_10_mdl[rand_idx]$GT4 <- NA
+        top_10_mdl
+    }
+    
+}
+```
+
+# Testing
+
+The following section will test the speed of the predictions and \##
+Create Test Set
+
+```{r, message=FALSE}
+library(quanteda)
+library(data.table)
+library(tidyr)
+library(dplyr)
+
+test <- readRDS("testing_tokens.RDS")
+test <- tokens_sample(test, size = 1000)
+
+get_ngramtoks <- function(n) {
+    tokens_ngrams(test, n = n, concatenator = " ")
+}
+
+testgrams <- get_ngramtoks(4)
+freqs <- featfreq(dfm(testgrams))
+
+testSet <- data.table(full = names(freqs)) %>% 
+    mutate(
+        x = sapply(full, function(x) {
+            paste(
+                strsplit(x, " ")[[1]][1:3], collapse = " "
+            )
+        }),
+        y = sapply(full, function(x) strsplit(x, " ")[[1]][4])
+    ) %>% 
+    as.data.table() %>%
+    drop_na()
+
+testSet <- cbind(testSet, pred = "", result = NA, top3 = NA, random = NA)
+head(testSet, 3)
+rm(test); invisible(gc())
+```
+
+## Speed Test
+
+The speed test will measure the average time to make a prediction.
+
+```{r}
+library(tictoc)
+
+tic.clearlog()
+for (x in 1:100) {
+    tic(x)
+    out <- nextWord(testSet[x]$x, n = 3)
+    toc(log = TRUE, quiet = TRUE)
+}
+log.lst <- tic.log(format = FALSE)
+timings <- unlist(lapply(log.lst, function(x) x$toc - x$tic))
+mean(timings)
+```
+
+## Next Word Accuracy and Top 3 Testing
+
+The next word accuracy and top 3 accuracy will be tested on the test
+set.
+
+```{r}
+for (n in 1:nrow(testSet)) {
+    pred_y <- nextWord(testSet[n]$x, n = 3)
+    test_y <- testSet[n]$y
+
+    testSet[n]$result <- (pred_y[1]$y == test_y)
+    testSet[n]$pred <- pred_y[1]$y
+    testSet[n]$top3 <- (test_y %in% pred_y$y)
+    testSet[n]$random <- ifelse(
+        length(which(is.na(c(pred_y$GT2, pred_y$GT3, pred_y$GT4)))) > 0,
+        FALSE,
+        TRUE
+    ) 
+}
+
+print(count(testSet, testSet$result))
+print(count(testSet, testSet$top3))
+print(count(testSet, testSet$random))
+```
+
+# Improvements
+
+The model has reasonable accuracy performance and good prediction speed.
+The following are some ideas improvements that could be explored to
+further improve the accuracy:
+
+-   Implement discounting using the full Kat'z Backoff Model, currently
+    only the Good-Turing portion is implemented
+
+-   Interpolation weights could be selected using gradient descent

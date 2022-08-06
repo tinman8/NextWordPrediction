@@ -1,0 +1,168 @@
+---
+title: "Next Word Prediction with N-Gram Models"
+author: "TI"
+date: "`r Sys.Date()`"
+output: slidy_presentation
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+```
+
+## Why Next Word Prediction?
+
+Next word prediction has numerous use cases, such as increasing productivity in word processing or allowing users to text faster on their phones. These applications can generate large value for users, with minimal development and small overhead on a users device.
+
+Next word prediction is already implemented in many apps, but is generalized to a large user base. There is an opportunity to create tailored prediction models specific to a business or industry. This application is a starting point to creating these tailored models and creating functional next word prediction application for business use.
+
+## N-Gram Models
+
+An N-Gram model was used for this application. This type of model was selected for its relative simplicity, ability to make predictions fast, and good prediction accuracy. A gram is a series of words in length N. The data used was a general data set from Twitter posts, blog posts, and news articles. The data can easily be swap to a data set that suits a specific business or industry need.
+
+This application used a model with one to four grams, making predictions using a probabilistic selection process. The probabilities are calculated using Good-Turing estimation, which adjusts for words not seen in the data by estimating the number of words not in the data set.
+
+A phrase is inputted, trimmed to the last 3 words, and these words are used as a starting point to select the most likely next word.
+
+A sample of the model is shown below. `x4`, `x3`, `x2` are the input columns, and `y` is the output column. The model makes predictions starting by finding a match in the `x4` column, calculating the probability of that match having the output `y`, and then repeats with `x3` and `x2`. The final prediction will be the word with the highest probability. The `GT` columns are the Good-Turing estimated probabilities in log scale.
+
+```{r, echo=FALSE}
+library(knitr)
+mdl <- readRDS("mdl.RDS")
+mdl <- mdl[51:53,]
+mdl$GT2 <- round(mdl$GT2, digits = 3)
+mdl$GT3 <- round(mdl$GT3, digits = 3)
+mdl$GT4 <- round(mdl$GT4, digits = 3)
+mdl$GTy <- round(mdl$GTy, digits = 3)
+```
+
+```{r, echo = FALSE}
+kable(mdl, "simple")
+```
+
+## Accuracy and Speed
+
+Speed and accuracy are the most important performance indicators when evaluating the model. The average user can type between 38 and 40 words per minute. A prediction needs to be made faster then a user can type it, so that the user wants to use the predicted word instead of typing it. The accuracy needs to be high enough to provide words that are relevant to the user.
+
+A sample of the prediction speed and accuracy testing results are shown.
+
+```{r, echo=FALSE, message=-(1:7)}
+library(quanteda)
+library(data.table)
+library(tidyr)
+library(dplyr)
+library(tictoc)
+library(scales)
+source("predict.R")
+
+test <- readRDS("testing_tokens.RDS")
+test <- tokens_sample(test, size = 100)
+
+get_ngramtoks <- function(n) {
+    tokens_ngrams(test, n = n, concatenator = " ")
+}
+
+testgrams <- get_ngramtoks(4)
+freqs <- featfreq(dfm(testgrams))
+
+testSet <- data.table(full = names(freqs)) %>% 
+    mutate(
+        x = sapply(full, function(x) {
+            paste(
+                strsplit(x, " ")[[1]][1:3], collapse = " "
+            )
+        }),
+        y = sapply(full, function(x) strsplit(x, " ")[[1]][4])
+    ) %>% 
+    as.data.table() %>%
+    drop_na()
+
+testSet <- cbind(testSet, pred = "", result = NA, top3 = NA, random = NA)
+rm(test); invisible(gc())
+
+tic.clearlog()
+for (x in 1:100) {
+    tic(x)
+    out <- nextWord(testSet[x]$x, n = 3)
+    toc(log = TRUE, quiet = TRUE)
+}
+log.lst <- tic.log(format = FALSE)
+timings <- unlist(lapply(log.lst, function(x) x$toc - x$tic))
+
+for (n in 1:nrow(testSet)) {
+    pred_y <- nextWord(testSet[n]$x, n = 3)
+    test_y <- testSet[n]$y
+
+    testSet[n]$result <- (pred_y[1]$y == test_y)
+    testSet[n]$pred <- pred_y[1]$y
+    testSet[n]$top3 <- (test_y %in% pred_y$y)
+    testSet[n]$random <- ifelse(
+        length(which(is.na(c(pred_y$GT2, pred_y$GT3, pred_y$GT4)))) > 0,
+        FALSE,
+        TRUE
+    ) 
+}
+
+accuracy <- count(testSet, testSet$result)
+accuracy <- label_percent()(accuracy$n[2] / (accuracy$n[1] + accuracy$n[2]))
+
+top3 <- count(testSet, testSet$top3)
+top3 <- label_percent()(top3$n[2] / (top3$n[1] + top3$n[2]))
+
+display <- data.frame(MeanTime = mean(timings), NextWordAccuracy = accuracy, Top3Accuracy = top3)
+kable(display, "simple", align = "c")
+```
+
+## Sample Predictions
+
+The following shows examples of predictions made by the model. The inputs were selected from BBC articles to showcase the correct word being predicted and the correct word being in the top 3 of predictions.
+
+### Sample of the correct word being predicted
+
+-   **Input phrase**: "Long-term stays continued to be the fastest"
+-   **Correct next word**: "growing"
+-   Source: <https://www.bbc.com/news/business-62402111>
+
+#### Prediction
+
+```{r, echo=FALSE}
+# Source = https://www.bbc.com/news/business-62402111
+out <- nextWord("Long-term stays continued to be the fastest", n = 1)
+kable(data.frame(
+    Input = c(
+        "Long-term stays continued to be the fastest"
+        ),
+    Output = out$y[1],
+    Probability = sapply(out$GT[1], function(x) label_percent(accuracy = 0.001)(10^x))
+ ))
+```
+
+### Sample of the correct word being in the Top 3
+
+-   **Input phrase**: "It is thought his equipment went missing when the flight"
+-   **Correct next word**: "from"
+-   Source: <https://www.bbc.com/news/uk-wales-62440213>
+
+#### Predictions
+
+```{r, echo=FALSE}
+# Top Prediciton
+# Source = https://www.bbc.com/news/uk-wales-62440213
+out <- nextWord("It is thought his equipment went missing when the flight", n = 2)
+
+kable(data.frame(
+    Input = c(
+        "It is thought his equipment went missing when the flight", 
+        "It is thought his equipment went missing when the flight"
+        ),
+    Output = out$y[1:2],
+    Probability = sapply(out$GT[1:2], function(x) label_percent(accuracy = 0.001)(10^x))
+ ))
+```
+
+## Next Steps
+
+For more information, and to use this model to make your own predictions, check out the following:
+
+-   Shiny App: [https://tinman.shinyapps.io/NextWordPrediction](https://tinman.shinyapps.io/NextWordPrediction/)/
+
+-   GitHub: <https://github.com/tinman8/NextWordPrediction>
